@@ -1,0 +1,60 @@
+name "gapi"
+description "Обвязка графического интерфейса над бекендами других интерфейсов для доступа к многопоточности и разрешения конфликта систем, используется в личных целях и опубликован в идеях того, что кому либо он может пригодиться"
+authors "Тосюков Назар <mrnazar44@gmail.com>"
+copyright "Copyright © 2022, Тосюков Назар"
+license "MIT"
+
+-- Системные зависимости.
+dependency "bindbc-loader" version="~>1.0.1"
+
+-- Бэкенд OpenGL библиотеки на операционной системе Windows.
+-- Нужен для тестрирования возможностей.
+configuration "glbackend-wgl-executable" {
+    platforms "windows"
+    targetType "executable"
+
+    dependency "bindbc-opengl" version="~>1.0.2"
+
+    versions "GL_46" "GL_ARB" "BackendGL"
+}
+
+-- Бэкенд OpenGL библиотеки на операционной системе Windows.
+configuration "glbackend-wgl" {
+    platforms "windows"
+    targetType "library"
+
+    dependency "bindbc-opengl" version="~>1.0.2"
+
+    versions "GL_46" "GL_ARB" "BackendGL"
+}
+
+-- Бэкенд OpenGL библиотеки на операционной системе, совместимой с Posix.
+configuration "glbackend-glx" {
+    platforms "posix"
+    targetType "library"
+
+    dependency "bindbc-opengl" version="~>1.0.2"
+    dependency "x11" version="~>1.0.21"
+
+    versions "Dynamic_GLX" "GL_46" "GL_ARB" "BackendGL"
+}
+
+-- Бэкенд DirectX библиотеки на операционной системе Windows.
+-- (НА ДАННЫЙ МОМЕНТ НЕ РЕАЛИЗОВАН, РЕЗЕРВИРОВАН)
+configuration "dxbackend" {
+    platforms "windows"
+    targetType "library"
+
+    dependency "directx-d" version="~>0.14.0"
+    versions "BackendDX"
+}
+
+-- Бэкенд Vulkan библиотеки на операционных системах Windows и Posix совместимых.
+-- (НА ДАННЫЙ МОМЕНТ НЕ РЕАЛИЗОВАН, РЕЗЕРВИРОВАН)
+configuration "vkbackend" {
+    platforms "windows" "posix"
+    targetType "library"
+
+    dependency "erupted" version="~>2.1.78+v1.3.228"
+    versions "BackendVK"
+}
