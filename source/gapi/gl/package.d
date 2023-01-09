@@ -1,3 +1,5 @@
+module gapi.gl;
+
 import gapi; //
 
 version(BackendGL):
@@ -45,6 +47,14 @@ import std.experimental.allocator;
 static this()
 {
     createInstance = &glCreateInstance;
+    enumerateExtensions  = &glEnumerateExtensions;
+}
+
+string[] glEnumerateExtensions(
+    RCIAllocator allocator
+)
+{
+    return null;
 }
 
 string[] cstrlist(const(char*) cstr) pure @trusted
@@ -136,6 +146,11 @@ final class GLFrameBuffer : FrameBuffer
     }
 }
 
+enum BufferMode : int
+{
+    opengl
+}
+
 final class GLBuffer : Buffer
 {
     public
@@ -143,8 +158,10 @@ final class GLBuffer : Buffer
         uint id;
         BufferUsage type;
         bool hasMap = false;
+        size_t _length;
+        BufferMode mode;
 
-        this(BufferUsage type)
+        void glCreate(BufferUsage type)
         {
             if (type == BufferUsage.renderbuffer)
             {
@@ -157,10 +174,21 @@ final class GLBuffer : Buffer
             this.type = type;
         }
 
+        this(BufferUsage type)
+        {
+            glCreate(type);
+        }
+
         void alloc(size_t size)
         {
             glNamedBufferData(id, cast(GLsizeiptr) size, null, GL_STATIC_DRAW);
+            this._length = size;
         }
+
+        override immutable(size_t) length() @safe
+        {
+            return this._length;
+        } 
     }
 }
 
@@ -497,6 +525,39 @@ uint glTexType(ImageType type)
     }
 }
 
+final class GLImageView : ImageView
+{
+    uint id;
+    GLImage source;
+
+    this(shared CmdCreateImageView imgVw)
+    {
+        source = cast(GLImage) imgVw.viewInfo.image;
+
+        glCreateTextures(glTexType(imgVw.viewInfo.viewType), 1, &id);
+        view(imgVw);
+    }
+
+    void view(T)(T imgVw)
+    {
+        glTextureView(
+            source.id,
+            glTexType(imgVw.viewInfo.viewType),
+            id,
+            glInternalFormat(imgVw.viewInfo.format),
+            cast(uint) imgVw.viewInfo.baseLevel,
+            cast(uint) imgVw.viewInfo.numLevels,
+            cast(uint) imgVw.viewInfo.baseLayer,
+            cast(uint) imgVw.viewInfo.numLayers
+        );
+    }
+
+    ~this()
+    {
+        glDeleteTextures(1, &id);
+    }
+}
+
 final class GLImage : Image
 {
     uint id;
@@ -504,9 +565,11 @@ final class GLImage : Image
     uint height_;
     uint depth_;
     uint iformat;
+    ImageType itype;
 
     this(shared CmdCreateImage imgCrt)
     {
+        itype = imgCrt.type;
         auto type = glTexType(imgCrt.type);
         auto format = glInternalFormat(imgCrt.format);
         iformat = format;
@@ -614,12 +677,11 @@ final class GLSampler : Sampler //
 }
 
 final class GLDevice : Device
-{
-    import std.experimental.logger;
-    
+{   
     import gapi.extensions.utilmessenger;
     import gapi.extensions.backendnative;
     import gapi.extensions.errhandle;
+    import gapi.extensions.inputvalidate;
 
     private
     {
@@ -629,6 +691,7 @@ final class GLDevice : Device
         LoggingDeviceInfo lgInfo;
         NativeLoggingInfo nlgInfo;
         ErrorLayerInfo errInfo;
+        InputValidationLayer ivInfo;
     }
 
     public
@@ -644,30 +707,27 @@ final class GLDevice : Device
                 {
                     case "GAPIDebugUtilMessenger":
                     {
-                        if (e.initData.length != LoggingDeviceInfo.sizeof)
-                            continue;
-
-                        lgInfo = *(cast(LoggingDeviceInfo*) e.initData.ptr);
+                        lgInfo = e.loggingDeviceInfo;
                         lgInfo.logger.info("Logger has connected!");
                     }
                     break;
 
                     case "GPUNativeBackendUtilMessenger":
                     {
-                        if (e.initData.length != NativeLoggingInfo.sizeof)
-                            continue;
-
-                        nlgInfo = *(cast(NativeLoggingInfo*) e.initData.ptr);
+                        nlgInfo = e.nativeLoggingInfo;
                         nlgInfo.logger.info("Native logger has connected!");
                     }
                     break;
 
                     case "GAPIErrorHandle":
                     {
-                        if (e.initData.length != ErrorLayerInfo.sizeof)
-                            continue;
+                        errInfo = e.errorLayerInfo;
+                    }
+                    break;
 
-                        errInfo = *(cast(ErrorLayerInfo*) e.initData.ptr);
+                    case "GAPIInputValidate":
+                    {
+                        ivInfo = e.inputValidationLayer;
                     }
                     break;
 
@@ -691,6 +751,8 @@ final class GLDevice : Device
                 e.flag = gpdevice.fprops[i].queueFlags;
             }
 
+            int err;
+
             handleLayers(vls);
         }
 
@@ -710,16 +772,24 @@ final class GLDevice : Device
         GLPipeline rpb_pl;
 
         void globalError(
+            string message,
             shared Command command
         )
         {
             debug
             {
-                throw new Exception("ATAAAS!", command.file, command.line);
+                throw new Exception(message, command.file, command.line);
             } else
             {
-                throw new Exception("ATAAAS!");
+                throw new Exception(message);
             }
+        }
+
+        void globalError(
+            shared Command command
+        )
+        {
+            globalError("ATAAS!", command);
         }
 
         void handleError(
@@ -749,16 +819,145 @@ final class GLDevice : Device
                 handleQueues_modern(q);
         }
 
+        void handleQueueComp_modern(ref GLQueue q)
+        {
+            import core.atomic;
+
+            foreach (ref pl; q.pl)
+            {
+                if (ivInfo.callback !is null)
+                {
+                    ErrorInfo errInfoDelta;
+                    ivInfo.callback(
+                        cast(shared Queue) q,
+                        cast(immutable) pl,
+                        errInfoDelta
+                    );
+
+                    if (errInfoDelta.code != 0)
+                    {
+                        if (errInfo.callback !is null)
+                        {
+                            bool ok = true;
+                            shared Command command = cast(shared) errInfoDelta.command;
+                            string message = errInfoDelta.message;
+
+                            mixin implErrState!(message, command);
+
+                            errInfo.callback(
+                                state,
+                                ok
+                            );
+
+                            if (!ok)
+                            {
+                                globalError(command);
+                            }
+                        } else
+                        {
+                            handleError(
+                                cast(shared) errInfoDelta.command,
+                                errInfoDelta.message
+                            );
+                        }
+                    }
+                }
+
+                handlePoolComp_modern(cast(shared) q, cast(shared) pl);
+                pl.commands = [];
+            }
+            
+            q.hasExecute = true;
+            q.pl = [];
+        }
+
+        void handlePoolComp_modern(shared GLQueue queue, ref shared CommandPool pl)
+        {
+            import core.atomic;
+
+            if (pl.commands.length == 0)
+                return;
+
+            foreach (shared Command e; cast(shared) pl.commands)
+            {
+                switch (e.type)
+                {
+                    case CommandType.createComputePipeline:
+                    {
+
+                    }
+                    break;
+
+                    default:
+                    break;
+                }
+            }   
+
+            import core.sync.semaphore;
+
+            if (pl.semaphore !is null)
+            {
+                if (lgInfo.hasLogging && lgInfo.loggingLayer.semaphoreNotifyLayer)
+                {
+                    lgInfo.logger.info("<...> Semaphore notify");
+                }
+
+                (cast(Semaphore) pl.semaphore).notify();
+            }
+
+            pl = CommandPool();
+        }
+
         void handleQueues_modern(ref GLQueue q)
         {
             import core.atomic;
 
             foreach (ref pl; q.pl)
             {
+                if (ivInfo.callback !is null)
+                {
+                    ErrorInfo errInfoDelta;
+                    ivInfo.callback(
+                        cast(shared Queue) q,
+                        cast(immutable) pl,
+                        errInfoDelta
+                    );
+
+                    if (errInfoDelta.code != 0)
+                    {
+                        if (errInfo.callback !is null)
+                        {
+                            bool ok = true;
+                            shared Command command = cast(shared) errInfoDelta.command;
+                            string message = errInfoDelta.message;
+
+                            mixin implErrState!(message, command);
+
+                            errInfo.callback(
+                                state,
+                                ok
+                            );
+
+                            if (!ok)
+                            {
+                                globalError(command);
+                            }
+                        } else
+                        {
+                            handleError(
+                                cast(shared) errInfoDelta.command,
+                                errInfoDelta.message
+                            );
+                        }
+                    }
+                }
+
                 handlePool_modern(cast(shared) q, cast(shared) pl);
+                pl.commands = [];
             }
 
             q.hasExecute = true;
+            q.pl = [];
         }
 
         void handleQueues_modern(shared GLQueue q)
@@ -777,8 +976,8 @@ final class GLDevice : Device
         {
             import core.atomic;
 
-            if ((q.flag & pl.cmdFlag) != pl.cmdFlag)
-                return;
+            // if ((q.flag & pl.cmdFlag) != pl.cmdFlag)
+            //     return;
 
             if (pl.commands.length == 0)
                 return;
@@ -818,8 +1017,20 @@ final class GLDevice : Device
                                 handleError(e, message);
                             }
                         }
-                        GLSwapChain sc = cast(GLSwapChain) e.presentInfo.swapChain;
-                        sc.swapBuffers(e.presentInfo);
+
+                        version(Windows)
+                        {
+                            import gapi.gl.extensions.win32wi;
+                            GLWin32SwapChain sc = cast(GLWin32SwapChain) e.presentInfo.swapChain;
+                            sc.swapBuffers(e.presentInfo);
+                        }
+                        
+                        version(Posix)
+                        {
+                            import gapi.gl.extensions.pxx11;
+                            GLPosixX11SwapChain sc = cast(GLPosixX11SwapChain) e.presentInfo.swapChain;
+                            sc.swapBuffers(e.presentInfo);
+                        }
                     }
                     break;
 
@@ -912,6 +1123,37 @@ final class GLDevice : Device
                     case CommandType.allocRenderBuffer:
                     {
                         GLBuffer bf = cast(GLBuffer) e.allocRenderBufferInfo.buffer;
+
+                        if (bf is null)
+                        {
+                            immutable message = "<allocRenderBuffer> The buffer is damaged.";
+
+                            if (lgInfo.hasLogging && lgInfo.loggingLayer.errorLayer)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                
+                                mixin implErrState!(message, e);
+
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+
+                                if (!ok)
+                                {
+                                    globalError(e);
+                                }
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
                         if (lgInfo.hasLogging && lgInfo.loggingLayer.warningLayer)
                         {
                             if (e.allocRenderBufferInfo.width == 0 ||
@@ -935,8 +1177,90 @@ final class GLDevice : Device
                         GLBuffer bf = cast(GLBuffer) e.frameBufferBindBuffer.buffer;
                         GLFrameBuffer fb = cast(GLFrameBuffer) e.frameBufferBindBuffer.frameBuffer;
 
+                        if (bf is null)
+                        {
+                            immutable message = "<frameBufferBindBuffer> The frame buffer is damaged.";
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                
+                                mixin implErrState!(message, e);
+
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+
+                                if (!ok)
+                                {
+                                    globalError(e);
+                                }
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
+                        if (bf is null)
+                        {
+                            immutable message = "<frameBufferBindBuffer> The buffer is damaged.";
+
+                            if (lgInfo.hasLogging && lgInfo.loggingLayer.errorLayer)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                
+                                mixin implErrState!(message, e);
+
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+
+                                if (!ok)
+                                {
+                                    globalError(e);
+                                }
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
                         if (bf.type != BufferUsage.renderbuffer)
-                            continue;
+                        {
+                            immutable message = "<frameBufferBindBuffer> The buffer is not intended for use under the frame.";
+
+                            if (lgInfo.hasLogging && lgInfo.loggingLayer.errorLayer)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                
+                                mixin implErrState!(message, e);
+
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+
+                                if (!ok)
+                                {
+                                    globalError(e);
+                                }
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
 
                         glNamedFramebufferRenderbuffer(fb.id, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, bf.id);
                     }
@@ -945,6 +1269,37 @@ final class GLDevice : Device
                     case CommandType.clearFrameBuffer:
                     {
                         GLFrameBuffer fb = cast(GLFrameBuffer) e.clearFrameBufferInfo.frameBuffer;
+
+                        if (fb is null)
+                        {
+                            immutable message = "<clearFrameBuffer> frame buffer is damaged.";
+
+                            if (lgInfo.hasLogging && lgInfo.loggingLayer.errorLayer)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                
+                                mixin implErrState!(message, e);
+
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+
+                                if (!ok)
+                                {
+                                    globalError(e);
+                                }
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
                         glClearNamedFramebufferfv(
                             fb.id,
                             GL_COLOR,
@@ -957,6 +1312,37 @@ final class GLDevice : Device
                     case CommandType.blitFrameBufferToSurface:
                     {
                         GLFrameBuffer fb = cast(GLFrameBuffer) e.blitFrameBufferToSurfaceInfo.frameBuffer;
+
+                        if (fb is null)
+                        {
+                            immutable message = "<blitFrameBufferToSurface> frame buffer is damaged.";
+
+                            if (lgInfo.hasLogging && lgInfo.loggingLayer.errorLayer)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                
+                                mixin implErrState!(message, e);
+
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+
+                                if (!ok)
+                                {
+                                    globalError(e);
+                                }
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
                         glBlitNamedFramebuffer(
                             fb.id,
                             0,
@@ -999,6 +1385,11 @@ final class GLDevice : Device
                         {
                             immutable message = "<compileShaderModule> Compilation to SPIRV code is not supported at the moment.";
 
+                            if (lgInfo.hasLogging && lgInfo.loggingLayer.errorLayer)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
                             if (errInfo.callback !is null)
                             {
                                 bool ok = true;
@@ -1038,6 +1429,66 @@ final class GLDevice : Device
 
                     case CommandType.createShaderModule:
                     {
+                        if (e.createShaderModuleInfo.shaderModule is null)
+                        {
+                            immutable message = "<createShaderModule> shader module pointer is damaged.";
+
+                            if (lgInfo.hasLogging && lgInfo.loggingLayer.errorLayer)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                
+                                mixin implErrState!(message, e);
+
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+
+                                if (!ok)
+                                {
+                                    globalError(e);
+                                }
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
+                        if (e.createShaderModuleInfo.code.length == 0)
+                        {
+                            immutable message = "<createShaderModule> shader code is empty.";
+
+                            if (lgInfo.hasLogging && lgInfo.loggingLayer.errorLayer)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                
+                                mixin implErrState!(message, e);
+
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+
+                                if (!ok)
+                                {
+                                    globalError(e);
+                                }
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
                         *e.createShaderModuleInfo.shaderModule = cast(shared(ShaderModule)) make!(GLShaderModule)(allocator,
                             e.createShaderModuleInfo.codeType,
                             e.createShaderModuleInfo.stage,
@@ -1057,6 +1508,36 @@ final class GLDevice : Device
 
                     case CommandType.createPipeline:
                     {
+                        if (e.createPipelineInfo.pipeline is null)
+                        {
+                            immutable message = "<createPipeline> The pointer to the pipeline is damaged.";
+
+                            if (lgInfo.hasLogging && lgInfo.loggingLayer.errorLayer)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                
+                                mixin implErrState!(message, e);
+
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+
+                                if (!ok)
+                                {
+                                    globalError(e);
+                                }
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
                         *e.createPipelineInfo.pipeline = cast(shared) make!(GLPipeline)(allocator, e.createPipelineInfo, allocator);
                     }
                     break;
@@ -1064,6 +1545,37 @@ final class GLDevice : Device
                     case CommandType.allocBuffer:
                     {
                         GLBuffer buffer = cast(GLBuffer) e.allocBufferInfo.buffer;
+
+                        if (buffer is null)
+                        {
+                            immutable message = "<allocBuffer> The buffer is damaged.";
+
+                            if (lgInfo.hasLogging && lgInfo.loggingLayer.errorLayer)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                
+                                mixin implErrState!(message, e);
+
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+
+                                if (!ok)
+                                {
+                                    globalError(e);
+                                }
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
                         buffer.alloc (e.allocBufferInfo.size);
                     }
                     break;
@@ -1109,6 +1621,66 @@ final class GLDevice : Device
 
                                 if (!ok)
                                     globalError(e);
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
+                        if (e.buffSetDataInfo.offset + e.buffSetDataInfo.size > buffer.length)
+                        {
+                            immutable message = "<buffSetData> The size of the data block exceeds the size of the buffer.";
+
+                            if (lgInfo.hasLogging && lgInfo.loggingLayer.errorLayer)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                
+                                mixin implErrState!(message, e);
+
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+
+                                if (!ok)
+                                {
+                                    globalError(e);
+                                }
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
+                        if (e.buffSetDataInfo.size > e.buffSetDataInfo.data.length)
+                        {
+                            immutable message = "<buffSetData> The size of the data block exceeds the size of the input data.";
+
+                            if (lgInfo.hasLogging && lgInfo.loggingLayer.errorLayer)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                
+                                mixin implErrState!(message, e);
+
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+
+                                if (!ok)
+                                {
+                                    globalError(e);
+                                }
                             } else
                             {
                                 handleError(e, message);
@@ -1179,6 +1751,7 @@ final class GLDevice : Device
                             if (lgInfo.hasLogging)
                             {
                                 lgInfo.logger.warning("The buffer has already been mapped.");
+                                continue;
                             }
                         }
 
@@ -1276,6 +1849,7 @@ final class GLDevice : Device
 
                                     lgInfo.logger.info("In `" ~ e.file ~ ":" ~ e.line.to!string);
                                 }
+
                                 lgInfo.logger.warning("The buffer has already been unmapped.");
                             }
                         }
@@ -1287,12 +1861,72 @@ final class GLDevice : Device
                         rpb = true;
                         rpb_fb = cast(GLFrameBuffer) e.renderPassBegin.frameBuffer;
 
+                        if (rpb_fb is null)
+                        {
+                            immutable message = "<renderPassBegin> The framebuffer is damaged.";
+
+                            if (lgInfo.hasLogging && lgInfo.loggingLayer.errorLayer)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                
+                                mixin implErrState!(message, e);
+
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+
+                                if (!ok)
+                                {
+                                    globalError(e);
+                                }
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
                         glClearNamedFramebufferfv(rpb_fb.id, GL_COLOR, 0, cast(float*) e.renderPassBegin.clearColor.ptr);
                     }
                     break;
 
                     case CommandType.createImage:
                     {
+                        if (e.createImageInfo.image is null)
+                        {
+                            immutable message = "<createImage> The pointer to the image is damaged.";
+
+                            if (lgInfo.hasLogging && lgInfo.loggingLayer.errorLayer)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                
+                                mixin implErrState!(message, e);
+
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+
+                                if (!ok)
+                                {
+                                    globalError(e);
+                                }
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
                         GLImage img = make!(GLImage)(allocator, e.createImageInfo);
                         *e.createImageInfo.image = cast(shared Image) img;
                     }
@@ -1300,12 +1934,42 @@ final class GLDevice : Device
 
                     case CommandType.bindImageMemory:
                     {
-                        // CmdBindImageMemory
                         GLImage img = cast(GLImage) e.bindImageMemoryInfo.image;
+
+                        if (img is null)
+                        {
+                            immutable message = "<bindImageMemory> The image descriptor is corrupted.";
+
+                            if (lgInfo.hasLogging && lgInfo.loggingLayer.errorLayer)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                
+                                mixin implErrState!(message, e);
+
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+
+                                if (!ok)
+                                {
+                                    globalError(e);
+                                }
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
                         if (e.bindImageMemoryInfo.length + e.bindImageMemoryInfo.offset > e.bindImageMemoryInfo.data.length)
                         {
                             immutable message = "The size in the arguments is larger than the array itself.";
-                            if (lgInfo.hasLogging && lgInfo.logger !is null)
+                            if (lgInfo.hasLogging && lgInfo.logger.log !is null)
                             {
                                 lgInfo.logger.error(message);
                             }
@@ -1326,21 +1990,63 @@ final class GLDevice : Device
                             }
                         }
 
-                        glTextureSubImage2D(
-                            img.id,
-                            0, 0, 0,
-                            img.width, img.height,
-                            GL_RGBA,
-                            GL_UNSIGNED_BYTE,
-                            cast(const(void)*) e
-                                .bindImageMemoryInfo
-                                .data[e.bindImageMemoryInfo.offset .. e.bindImageMemoryInfo.offset + e.bindImageMemoryInfo.length].ptr
-                        );
+                        if (img.itype == ImageType.image1D)
+                        {
+                            glTextureSubImage1D(
+                                img.id,
+                                1,
+                                0,
+                                img.width,
+                                GL_RGBA,
+                                GL_UNSIGNED_BYTE,
+                                cast(const(void)*) e
+                                    .bindImageMemoryInfo
+                                    .data[e.bindImageMemoryInfo.offset .. e.bindImageMemoryInfo.offset + e.bindImageMemoryInfo.length].ptr
+                            );
+                        } else
+                        if (img.itype == ImageType.image2D)
+                        {
+                            glTextureSubImage2D(
+                                img.id,
+                                0, 0, 0,
+                                img.width, img.height,
+                                GL_RGBA,
+                                GL_UNSIGNED_BYTE,
+                                cast(const(void)*) e
+                                    .bindImageMemoryInfo
+                                    .data[e.bindImageMemoryInfo.offset .. e.bindImageMemoryInfo.offset + e.bindImageMemoryInfo.length].ptr
+                            );
+                        }
                     }
                     break;
 
                     case CommandType.createSampler:
                     {
+                        if (e.createSamplerInfo.sampler is null)
+                        {
+                            immutable message = "<createSampler> The pointer to the sampler is damaged.";
+                            
+                            if (lgInfo.hasLogging && lgInfo.logger.log !is null)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                mixin implErrState!(message, e);
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+                                if (!ok)
+                                    globalError(e);
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
                         GLSampler smp = make!(GLSampler)(allocator, e.createSamplerInfo);
                         *e.createSamplerInfo.sampler = cast(shared Sampler) smp;
                     }
@@ -1349,6 +2055,32 @@ final class GLDevice : Device
                     case CommandType.editSampler:
                     {
                         GLSampler smp = cast(GLSampler) e.editSamplerInfo.sampler;
+
+                        if (smp is null)
+                        {
+                            immutable message = "<editSampler> The handle to the sampler is damaged.";
+
+                            if (lgInfo.hasLogging && lgInfo.logger.log !is null)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                mixin implErrState!(message, e);
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+                                if (!ok)
+                                    globalError(e);
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
                         smp.edit(e.editSamplerInfo);
                     }
                     break;
@@ -1357,6 +2089,56 @@ final class GLDevice : Device
                     {
                         GLPipeline pp = cast(GLPipeline) e.drawInfo.pipeline;
                         GLBuffer vb = cast(GLBuffer) e.drawInfo.vertexBuffer;
+
+                        if (pp is null)
+                        {
+                            immutable message = "<draw> The handle to the pipeline is damaged.";
+
+                            if (lgInfo.hasLogging && lgInfo.logger.log !is null)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                mixin implErrState!(message, e);
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+                                if (!ok)
+                                    globalError(e);
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
+                        if (vb is null)
+                        {
+                            immutable message = "<draw> The handle to the vertices is damaged.";
+
+                            if (lgInfo.hasLogging && lgInfo.logger.log !is null)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                mixin implErrState!(message, e);
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+                                if (!ok)
+                                    globalError(e);
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
 
                         glEnable(GL_SCISSOR_TEST);
 
@@ -1367,6 +2149,8 @@ final class GLDevice : Device
 
                         if (pp.pipelineInfo.rasterization.depthClampEnable)
                             glEnable(GL_DEPTH_CLAMP);
+                        else
+                            glDisable(GL_DEPTH_CLAMP);
 
                         uint glPMode(PolygonMode pmode)
                         {
@@ -1388,6 +2172,8 @@ final class GLDevice : Device
 
                         if (pp.pipelineInfo.colorBlendAttachment.blendEnable)
                             glEnable(GL_BLEND);
+                        else
+                            glDisable(GL_BLEND);
 
                         int glBlendFactor(BlendFactor factor)
                         {
@@ -1459,6 +2245,8 @@ final class GLDevice : Device
 
                         if (pp.pipelineInfo.colorAttachment.sampleEnable)
                             glEnable(GL_MULTISAMPLE);
+                        else
+                            glDisable(GL_MULTISAMPLE);
 
                         if (vb !is null)
                         {
@@ -1474,27 +2262,31 @@ final class GLDevice : Device
                         glBindFramebuffer(GL_FRAMEBUFFER, rpb_fb.id);
                         glBindProgramPipeline((cast(GLPipeline) e.drawInfo.pipeline).id);
 
+                        uint bid = 0;
                         foreach (ef; pp.pipelineInfo.writeDescriptions)
                         {
                             if (ef.type == WriteDescriptType.uniform)
                             {
-                                size_t it = 0;
+                                uint it = 0;
+
                                 foreach (md; pp.pipelineInfo.stages)
                                 {
-                                    if ((ef.uniform.stageFlags & md.stage) == md.stage)
+                                    if (ef.uniform.stageFlags == md.stage)
                                     {
                                         immutable eg = pp.stages[it];
                                         GLBuffer bg = cast(GLBuffer) ef.uniform.buffer;
 
-                                        glUniformBlockBinding(eg.pid, ef.binding, ef.binding);
+                                        glUniformBlockBinding(eg.pid, ef.binding, bid);
 
                                         glBindBufferRange(
                                             GL_UNIFORM_BUFFER,
-                                            ef.binding,
+                                            bid,
                                             bg.id,
                                             cast(GLintptr) ef.uniform.offset,
                                             cast(GLsizeiptr) ef.uniform.size
                                         );
+
+                                        bid += 1;
                                     }
 
                                     it++;
@@ -1504,12 +2296,7 @@ final class GLDevice : Device
                             {
                                 if (ef.imageView.sampler is null)
                                 {
-                                    // if (pl.errorState !is null)
-                                    // {
-                                    //     pl.errorState.commandType = e.type;
-                                    //     pl.errorState.what = "The sampler object is empty.";
-                                    //     pl.errorState.code = 1;
-                                    // }
+                                    lgInfo.logger.warning("Sampler is empty!");
                                     continue;
                                 }
 
@@ -1570,6 +2357,106 @@ final class GLDevice : Device
                         GLBuffer    rb = cast(GLBuffer) e.copyBufferInfo.read,
                                     wb = cast(GLBuffer) e.copyBufferInfo.write;
 
+                        if (rb is null)
+                        {
+                            immutable message = "<copyBuffer> The handle on the read buffer is corrupted.";
+
+                            if (lgInfo.hasLogging && lgInfo.logger.log !is null)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                mixin implErrState!(message, e);
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+                                if (!ok)
+                                    globalError(e);
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
+                        if (wb is null)
+                        {
+                            immutable message = "<copyBuffer> The handle on the write buffer is corrupted.";
+
+                            if (lgInfo.hasLogging && lgInfo.logger.log !is null)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                mixin implErrState!(message, e);
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+                                if (!ok)
+                                    globalError(e);
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
+                        if (e.copyBufferInfo.srcOffset + e.copyBufferInfo.size > rb.length)
+                        {
+                            immutable message = "<copyBuffer> The size of the data block from the read buffer is smaller than the region in the arguments suggests.";
+
+                            if (lgInfo.hasLogging && lgInfo.logger.log !is null)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                mixin implErrState!(message, e);
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+                                if (!ok)
+                                    globalError(e);
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
+                        if (e.copyBufferInfo.dstOffset + e.copyBufferInfo.size > wb.length)
+                        {
+                            immutable message = "<copyBuffer> The size of the data block from the write buffer is smaller than the region in the arguments suggests.";
+
+                            if (lgInfo.hasLogging && lgInfo.logger.log !is null)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                mixin implErrState!(message, e);
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+                                if (!ok)
+                                    globalError(e);
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
                         glCopyNamedBufferSubData(
                             rb.id, wb.id,
                             cast(GLintptr) e.copyBufferInfo.srcOffset,
@@ -1584,6 +2471,32 @@ final class GLDevice : Device
                         import std.typecons : Nullable;
 
                         GLPipeline pip = cast(GLPipeline) e.pipelineEditInfo.pipeline;
+
+                        if (pip is null)
+                        {
+                            immutable message = "<pipelineEdit> The handle to the pipeline is damaged.";
+
+                            if (lgInfo.hasLogging && lgInfo.logger.log !is null)
+                            {
+                                lgInfo.logger.error(message);
+                            }
+
+                            if (errInfo.callback !is null)
+                            {
+                                bool ok = true;
+                                mixin implErrState!(message, e);
+                                errInfo.callback(
+                                    state,
+                                    ok
+                                );
+                                if (!ok)
+                                    globalError(e);
+                            } else
+                            {
+                                handleError(e, message);
+                            }
+                        }
+
                         if (!(cast(Nullable!ViewportState) e.pipelineEditInfo.state.viewportState).isNull)
                             pip.pipelineInfo.viewportState = cast(ViewportState) (cast(Nullable!ViewportState) e.pipelineEditInfo.state.viewportState).get;
 
@@ -1637,6 +2550,39 @@ final class GLDevice : Device
                     }
                     break;
 
+                    case CommandType.createImageView:
+                    {
+                        GLImageView iv = make!GLImageView(allocator, e.createImageViewInfo);
+                        *e.createImageViewInfo.imageView = cast(shared) iv;
+                    }
+                    break;
+
+                    case CommandType.updateImageView:
+                    {
+                        GLImageView iv = cast(GLImageView) e.updateImageViewInfo.imageView;
+                        iv.view(e.updateImageViewInfo);
+                    }
+                    break;
+
+                    case CommandType.extensionCommand:
+                    {
+                        switch (e.extensionInfo.extension)
+                        {
+                            case "GAPIVideoDecode":
+                            {
+                                //handleVideoDecodeCommand(e);
+                            }
+                            break;
+
+                            default:
+                            {
+
+                            }
+                            break;
+                        }
+                    }
+                    break;
+
                     default:
                         break;
                 }
@@ -1656,6 +2602,11 @@ final class GLDevice : Device
 
             pl = CommandPool();
         }
+    }
+
+    void handleVideoDecodeCommand(Command command)
+    {
+        // video decode
     }
 }
 
@@ -1846,7 +2797,7 @@ version(Windows)
         int[] attrib =  
         [
             WGL_CONTEXT_MAJOR_VERSION_ARB, 4,
-            WGL_CONTEXT_MINOR_VERSION_ARB, 5,
+            WGL_CONTEXT_MINOR_VERSION_ARB, 2,
             WGL_CONTEXT_FLAGS_ARB, WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB,
             WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB,
             0
@@ -1855,12 +2806,13 @@ version(Windows)
         auto mctx = wglCreateContextAttribsARB(     info.dc, 
                                                     null, 
                                                     attrib.ptr);
+
         if (mctx is null)
         {
             attrib =  
             [
-                WGL_CONTEXT_MAJOR_VERSION_ARB, 3,
-                WGL_CONTEXT_MINOR_VERSION_ARB, 3,
+                WGL_CONTEXT_MAJOR_VERSION_ARB, 4,
+                WGL_CONTEXT_MINOR_VERSION_ARB, 2,
                 WGL_CONTEXT_FLAGS_ARB, WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB,
                 WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB,
                 0
@@ -1898,6 +2850,123 @@ final class GLPhysDevice : PhysDevice
 {
     private
     {
+        void glInfo(ref PhysDeviceProperties prt)
+        {
+            import std.conv : to;
+
+            if (handle is null)
+            {
+                prt.deviceName = glGetString(GL_RENDERER).to!string;
+                prt.driverVersion = glGetString(GL_VERSION).to!string;
+            }
+
+            glGetIntegerv(GL_MAX_FRAMEBUFFER_LAYERS, cast(int*) &prt.limits.maxFramebufferLayers);
+            glGetIntegerv(GL_MAX_TEXTURE_SIZE, cast(int*) &prt.limits.maxTextureSize);
+            glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, cast(int*) &prt.limits.maxVertexInputAttribs);
+            glGetIntegerv(GL_MAX_VERTEX_OUTPUT_COMPONENTS, cast(int*) &prt.limits.maxVertexOutputComponents);
+            glGetIntegerv(GL_MAX_GEOMETRY_INPUT_COMPONENTS, cast(int*) &prt.limits.maxGeometryInputComponents);
+            glGetIntegerv(GL_MAX_GEOMETRY_OUTPUT_COMPONENTS, cast(int*) &prt.limits.maxGeometryOutputComponents);
+            glGetIntegerv(GL_MAX_FRAGMENT_INPUT_COMPONENTS, cast(int*) &prt.limits.maxFragmentInputComponents);
+            glGetIntegerv(GL_MAX_VERTEX_UNIFORM_BLOCKS, cast(int*) &prt.limits.maxVertexUniformBlocks);
+            glGetIntegerv(GL_MAX_FRAGMENT_UNIFORM_BLOCKS, cast(int*) &prt.limits.maxFragmentUniformBlocks);
+            prt.limits.maxFragmentOutputComponents = 4;
+            glGetIntegerv(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE, cast(int*) &prt.limits.maxComputeSharedMemorySize);
+            glGetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_COUNT, 0, cast(int*) &prt.limits.maxComputeWorkGroupCount[0]);
+            glGetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_COUNT, 1, cast(int*) &prt.limits.maxComputeWorkGroupCount[1]);
+            glGetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_COUNT, 2, cast(int*) &prt.limits.maxComputeWorkGroupCount[2]);
+            glGetIntegerv(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, cast(int*) &prt.limits.maxComputeWorkGroupInvocations);
+            glGetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_SIZE, 0, cast(int*) &prt.limits.maxComputeWorkGroupSize[0]);
+            glGetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_SIZE, 1, cast(int*) &prt.limits.maxComputeWorkGroupSize[1]);
+            glGetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_SIZE, 2, cast(int*) &prt.limits.maxComputeWorkGroupSize[2]);
+            glGetIntegerv(GL_SUBPIXEL_BITS, cast(int*) &prt.limits.subPixelPrecisionBits);
+            glGetIntegerv(GL_MAX_VIEWPORTS, cast(int*) &prt.limits.maxViewports);
+
+            string[] attribs = cstrlist(glGetString(GL_EXTENSIONS));
+
+            uint factors;
+            immutable needFactors = 4;
+
+            foreach (attrib; attribs)
+            {
+                switch (attrib)
+                {
+                    case "ARB_direct_state_access":
+                        factors++;
+                    break;
+
+                    case "GL_ARB_sampler_objects":
+                        factors++;
+                    break;
+
+                    case "GL_ARB_separate_shader_objects":
+                        factors++;
+                    break;
+
+                    case "GL_ARB_get_program_binary":
+                        factors++;
+                    break;
+
+                    case "GL_ARB_geometry_shader4":
+                        prt.features.geometryShader = true;
+                    break;
+
+                    case "GL_ARB_tessellation_shader":
+                        prt.features.tessellationShader = true;
+                    break;
+
+                    case "GL_ARB_multi_draw_indirect":
+                        prt.features.multiDrawIndirect = true;
+                    break;
+
+                    case "GL_ARB_texture_compression":
+                        prt.features.textureCompression = true;
+                    break;
+
+                    case "GL_ARB_texture_compression_bptc":
+                        prt.features.textureCompressionBPCT = true;
+                    break;
+
+                    case "GL_ARB_texture_compression_rgtc":
+                        prt.features.textureCompressionRGTC = true;
+                    break;
+
+                    case "GL_ARB_gpu_shader_int64":
+                        prt.features.shaderInt64 = true;
+                    break;
+
+                    case "GL_ARB_gpu_shader_fp64,":
+                        prt.features.shaderFloat64 = true;
+                    break;
+
+                    case "GL_ARB_cull_distance":
+                        prt.features.shaderCullDistance = true;
+                    break;
+
+                    case "GL_ARB_clip_control":
+                        prt.features.shaderClipDistance = true;
+                    break;
+
+                    case "GL_ARB_gl_spirv":
+                        prt.features.spirv = true;
+                    break;
+
+                    case "GL_ARB_viewport_array":
+                    {
+                        prt.features.scissor = true;
+                    }
+                    break;
+
+                    default:
+                        break;
+                }
+            }
+
+            if (factors < needFactors)
+            {
+                prt.avalibleForCreation = true;
+            }
+        }
+
         version(Windows)
         {
             DISPLAY_DEVICE dev;
@@ -1958,92 +3027,7 @@ final class GLPhysDevice : PhysDevice
                 prt.deviceName = glGetString(GL_RENDERER).to!string;
                 prt.driverVersion = glGetString(GL_VERSION).to!string;
 
-                uint dims;
-                glGetIntegerv(GL_MAX_FRAMEBUFFER_WIDTH, cast(int*) &dims);
-                prt.limits.maxFramebufferWidth = dims;
-                glGetIntegerv(GL_MAX_FRAMEBUFFER_HEIGHT, cast(int*) &dims);
-
-                prt.limits.maxFramebufferHeight = dims;
-                dims = 0;
-
-                glGetIntegerv(GL_MAX_FRAMEBUFFER_LAYERS, cast(int*) &dims);
-                prt.limits.maxFramebufferLayers = dims;
-
-                glGetIntegerv(GL_MAX_SAMPLES, cast(int*) &dims);
-                prt.limits.sampleCounts = dims;
-
-                glGetIntegerv(GL_MAX_TEXTURE_SIZE, cast(int*) &prt.limits.maxTextureSize);
-                glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, cast(int*) &prt.limits.maxVertexInputAttribs);
-                glGetIntegerv(GL_MAX_VERTEX_OUTPUT_COMPONENTS, cast(int*) &prt.limits.maxVertexOutputComponents);
-                glGetIntegerv(GL_MAX_GEOMETRY_INPUT_COMPONENTS, cast(int*) &prt.limits.maxGeometryInputComponents);
-                glGetIntegerv(GL_MAX_GEOMETRY_OUTPUT_COMPONENTS, cast(int*) &prt.limits.maxGeometryOutputComponents);
-                glGetIntegerv(GL_MAX_FRAGMENT_INPUT_COMPONENTS, cast(int*) &prt.limits.maxFragmentInputComponents);
-                glGetIntegerv(GL_MAX_VERTEX_UNIFORM_BLOCKS, cast(int*) &prt.limits.maxVertexUniformBlocks);
-                glGetIntegerv(GL_MAX_FRAGMENT_UNIFORM_BLOCKS, cast(int*) &prt.limits.maxFragmentUniformBlocks);
-                prt.limits.maxFragmentOutputComponents = 4;
-
-
-
-                char* cattribs;
-                if ((cattribs = cast(char*) glGetString(GL_EXTENSIONS)) is null)
-                {
-                    throw new UnsupportException(UnsupportType.interfaceBroken);
-                }
-                
-                string[] attribs = cstrlist(cattribs);
-
-                foreach (attrib; attribs)
-                {
-                    switch (attrib)
-                    {
-                        case "GL_ARB_geometry_shader4":
-                            prt.features.geometryShader = true;
-                        break;
-
-                        case "GL_ARB_tessellation_shader":
-                            prt.features.tessellationShader = true;
-                        break;
-
-                        case "GL_ARB_multi_draw_indirect":
-                            prt.features.multiDrawIndirect = true;
-                        break;
-
-                        case "GL_ARB_texture_compression":
-                            prt.features.textureCompression = true;
-                        break;
-
-                        case "GL_ARB_texture_compression_bptc":
-                            prt.features.textureCompressionBPCT = true;
-                        break;
-
-                        case "GL_ARB_texture_compression_rgtc":
-                            prt.features.textureCompressionRGTC = true;
-                        break;
-
-                        case "GL_ARB_gpu_shader_int64":
-                            prt.features.shaderInt64 = true;
-                        break;
-
-                        case "GL_ARB_gpu_shader_fp64,":
-                            prt.features.shaderFloat64 = true;
-                        break;
-
-                        case "GL_ARB_cull_distance":
-                            prt.features.shaderCullDistance = true;
-                        break;
-
-                        case "GL_ARB_clip_control":
-                            prt.features.shaderClipDistance = true;
-                        break;
-
-                        case "GL_ARB_gl_spirv":
-                            prt.features.spirv = true;
-                        break;
-
-                        default:
-                            break;
-                    }
-                }
+                glInfo(prt);
 
                 return prt;
             }
@@ -2053,6 +3037,14 @@ final class GLPhysDevice : PhysDevice
         {
             Display* dpy;
 
+            string c_str(char[] str)
+            {
+                size_t i = 0;
+                while (str[++i] != '\0') {}
+
+                return cast(string) str[0 .. i];
+            }
+
             PhysDeviceProperties getPropertiesPosixImpl() @trusted
             {
                 import bindbc.opengl;
@@ -2061,24 +3053,25 @@ final class GLPhysDevice : PhysDevice
                 dpy = XOpenDisplay(null);
 
                 PhysDeviceProperties prt;
-                char[] name = makeArray!(char)(allocator, 80);
 
-                nvmlDeviceGetName(handle, name.ptr, 80);
-                prt.deviceName = name.to!(string);
+                if (handle !is null)
+                {
+                    char[] name = makeArray!(char)(allocator, 80);
 
-                nvmlPciInfo_t pinfo;
-                nvmlDeviceGetPciInfo_v3(handle, &pinfo);
-                prt.deviceID = pinfo.pciDeviceId;
+                    nvmlDeviceGetName(handle, name.ptr, 80);
+                    prt.deviceName = c_str(cast(char[]) name.to!string);
 
-                nvmlSystemGetDriverVersion(name.ptr, 80);
-                prt.driverVersion = name.to!(string);
+                    nvmlPciInfo_t pinfo;
+                    nvmlDeviceGetPciInfo_v3(handle, &pinfo);
+                    prt.deviceID = pinfo.pciDeviceId;
 
-                allocator.deallocate(cast(void[]) name);
+                    nvmlSystemGetDriverVersion(name.ptr, 80);
+                    prt.driverVersion = c_str(cast(char[]) name.to!string);
+
+                    allocator.deallocate(cast(void[]) name);
+                }
 
                 prt.vendor = glXGetClientString(dpy, 1).to!string;
-
-                uint count;
-                nvmlVgpuTypeId_t[5] tts;
 
                 int cfglen;
                 GLXFBConfig* cfgs = glXGetFBConfigs(dpy, 0, &cfglen);
@@ -2108,7 +3101,7 @@ final class GLPhysDevice : PhysDevice
                 limits.maxFramebufferHeight = maxH;
                 limits.sampleCounts = smax;
 
-                prt.type = PhysDeviceType.discrete;
+                prt.type = handle is null ? PhysDeviceType.integrate : PhysDeviceType.discrete;
                 prt.limits = limits;
 
                 Window ww = XCreateSimpleWindow(dpy, RootWindow(dpy, 0),
@@ -2118,71 +3111,7 @@ final class GLPhysDevice : PhysDevice
 
                 loadOpenGL();
 
-                glGetIntegerv(GL_MAX_FRAMEBUFFER_LAYERS, cast(int*) &prt.limits.maxFramebufferLayers);
-                glGetIntegerv(GL_MAX_TEXTURE_SIZE, cast(int*) &prt.limits.maxTextureSize);
-                glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, cast(int*) &prt.limits.maxVertexInputAttribs);
-                glGetIntegerv(GL_MAX_VERTEX_OUTPUT_COMPONENTS, cast(int*) &prt.limits.maxVertexOutputComponents);
-                glGetIntegerv(GL_MAX_GEOMETRY_INPUT_COMPONENTS, cast(int*) &prt.limits.maxGeometryInputComponents);
-                glGetIntegerv(GL_MAX_GEOMETRY_OUTPUT_COMPONENTS, cast(int*) &prt.limits.maxGeometryOutputComponents);
-                glGetIntegerv(GL_MAX_FRAGMENT_INPUT_COMPONENTS, cast(int*) &prt.limits.maxFragmentInputComponents);
-                glGetIntegerv(GL_MAX_VERTEX_UNIFORM_BLOCKS, cast(int*) &prt.limits.maxVertexUniformBlocks);
-                glGetIntegerv(GL_MAX_FRAGMENT_UNIFORM_BLOCKS, cast(int*) &prt.limits.maxFragmentUniformBlocks);
-                prt.limits.maxFragmentOutputComponents = 4;
-
-                string[] attribs = cstrlist(glGetString(GL_EXTENSIONS));
-
-                foreach (attrib; attribs)
-                {
-                    switch (attrib)
-                    {
-                        case "GL_ARB_geometry_shader4":
-                            prt.features.geometryShader = true;
-                        break;
-
-                        case "GL_ARB_tessellation_shader":
-                            prt.features.tessellationShader = true;
-                        break;
-
-                        case "GL_ARB_multi_draw_indirect":
-                            prt.features.multiDrawIndirect = true;
-                        break;
-
-                        case "GL_ARB_texture_compression":
-                            prt.features.textureCompression = true;
-                        break;
-
-                        case "GL_ARB_texture_compression_bptc":
-                            prt.features.textureCompressionBPCT = true;
-                        break;
-
-                        case "GL_ARB_texture_compression_rgtc":
-                            prt.features.textureCompressionRGTC = true;
-                        break;
-
-                        case "GL_ARB_gpu_shader_int64":
-                            prt.features.shaderInt64 = true;
-                        break;
-
-                        case "GL_ARB_gpu_shader_fp64,":
-                            prt.features.shaderFloat64 = true;
-                        break;
-
-                        case "GL_ARB_cull_distance":
-                            prt.features.shaderCullDistance = true;
-                        break;
-
-                        case "GL_ARB_clip_control":
-                            prt.features.shaderClipDistance = true;
-                        break;
-
-                        case "GL_ARB_gl_spirv":
-                            prt.features.spirv = true;
-                        break;
-
-                        default:
-                            break;
-                    }
-                }
+                glInfo(prt);
 
                 unloadOpenGL();
 
@@ -2217,6 +3146,11 @@ final class GLPhysDevice : PhysDevice
             fprops = [gprops, cprops, tprops];
         }
 
+        this(RCIAllocator allocator)
+        {
+            this(null, allocator);
+        }
+
         version(Windows)
         this(DISPLAY_DEVICE dev, RCIAllocator allocator) @trusted
         {
@@ -2238,6 +3172,11 @@ final class GLPhysDevice : PhysDevice
 
             version(Windows)
                 return getPropertiesWinImpl();
+        }
+
+        string[] extensions()
+        {
+            return [];
         }
     }
 
@@ -2326,494 +3265,6 @@ extern(C) void __glLog(
     
 }
 
-final class GLSwapChain : SwapChain
-{
-    private
-    {
-        version(Posix)
-        {
-            Display* dpy;
-            GLXPixmap gpixmap;
-            Pixmap pixmap;
-            GLXContext context;
-            GC gc;
-            Window* wnd;
-
-            void swapBuffersPosixImpl() @trusted
-            {
-                glXSwapBuffers(dpy, *wnd);
-            }
-        }
-
-        version(Windows)
-        {
-            HMODULE hInstance;
-            HDC dc;
-
-            void swapBuffersWinImpl() @trusted
-            {
-                SwapBuffers(dc);
-            }
-        }
-    }
-
-    public
-    {
-        RCIAllocator allocator;
-
-        uint[2] extend;
-    }
-
-    public
-    {
-        version(Posix)
-        this(
-            Display* dpy,
-            GLSurface surface,
-            GLDevice gdevice,
-            CreateSwapChainInfo createInfo,
-            RCIAllocator allocator)
-        {
-            this.dpy = dpy;
-            this.wnd = surface.drawable;
-            this.allocator = allocator;
-
-            int fbcount = 0;
-            scope fbc = glXGetFBConfigs(dpy, 0, &fbcount); scope(exit) XFree(fbc);
-
-            if (fbcount == 0)
-            {
-                throw new Exception("Your system not enought fb configs");
-            }
-
-            GLXFBConfig cfg;
-
-            foreach (i; 0 .. fbcount)
-            {
-                int drw,
-                    rdtype,
-                    vstype,
-                    rs, gs, bs, as,
-                    ds, ss,
-                    db,
-                    sp;
-
-                glXGetFBConfigAttrib(dpy, fbc[i], GLX_DRAWABLE_TYPE, &drw);
-                glXGetFBConfigAttrib(dpy, fbc[i], GLX_RENDER_TYPE, &rdtype);
-                glXGetFBConfigAttrib(dpy, fbc[i], GLX_X_VISUAL_TYPE, &rdtype);
-                glXGetFBConfigAttrib(dpy, fbc[i], GLX_RED_SIZE, &rs);
-                glXGetFBConfigAttrib(dpy, fbc[i], GLX_GREEN_SIZE, &gs);
-                glXGetFBConfigAttrib(dpy, fbc[i], GLX_BLUE_SIZE, &bs);
-                glXGetFBConfigAttrib(dpy, fbc[i], GLX_ALPHA_SIZE, &as);
-                glXGetFBConfigAttrib(dpy, fbc[i], GLX_DEPTH_SIZE, &ds);
-                glXGetFBConfigAttrib(dpy, fbc[i], GLX_STENCIL_SIZE, &ss);
-                glXGetFBConfigAttrib(dpy, fbc[i], GLX_DOUBLEBUFFER, &db);
-                glXGetFBConfigAttrib(dpy, fbc[i], GLX_SAMPLES, &sp);
-
-                if ((drw & GLX_WINDOW_BIT) == GLX_WINDOW_BIT &&
-                    (rdtype & GLX_RGBA_BIT) == GLX_RGBA_BIT &&
-                    rs == createInfo.format.redSize &&
-                    gs == createInfo.format.greenSize &&
-                    bs == createInfo.format.blueSize &&
-                    as == createInfo.format.alphaSize &&
-                    ds == createInfo.format.depthSize &&
-                    ss == createInfo.format.stencilSize &&
-                    sp == createInfo.format.sampleCount &&
-                    db == (createInfo.presentMode != PresentMode.immediate)
-                    )
-                {
-                    cfg = fbc[i];
-                    break;
-                }
-            }
-
-            if (cfg is null)
-                throw new Exception("Not absolute config!");
-
-            XVisualInfo* vinfo = glXGetVisualFromFBConfig(dpy, cfg);
-
-            int[5] ctxAttrib = [
-                GLX_CONTEXT_MAJOR_VERSION_ARB, 4,
-                GLX_CONTEXT_MINOR_VERSION_ARB, 6,
-                None
-            ];
-
-            context = glXCreateContextAttribsARB(
-                dpy,
-                cfg,
-                null,
-                true,
-                ctxAttrib.ptr
-            );
-
-            XWindowAttributes wattribs;
-            XGetWindowAttributes(dpy, *wnd, &wattribs);
-
-            XDestroyWindow(dpy, *wnd);
-
-            XSetWindowAttributes windowAttribs;
-            windowAttribs.border_pixel = 0x000000;
-            windowAttribs.background_pixel = 0xFFFFFF;
-            windowAttribs.override_redirect = wattribs.override_redirect;
-            windowAttribs.colormap = XCreateColormap(dpy, RootWindow(dpy, 0),
-                                                     vinfo.visual, AllocNone);
-            windowAttribs.event_mask = wattribs.your_event_mask;
-
-            *wnd = XCreateWindow (
-                dpy, RootWindow(dpy, 0),
-                wattribs.x, wattribs.y,
-                wattribs.width, wattribs.height,
-                0,
-                vinfo.depth,
-                InputOutput,
-                vinfo.visual,
-                CWBackPixel | CWColormap | CWBorderPixel | CWEventMask,
-                &windowAttribs
-            );
-            XMapWindow(dpy, *wnd);
-
-            glXMakeCurrent(dpy, *wnd, context);
-
-            loadOpenGL();
-
-            glEnable(GL_DEBUG_OUTPUT);
-            glDebugMessageCallback(cast(GLDEBUGPROC) &__glLog, cast(void*) &gdevice.nlgInfo);
-        }
-
-        version(Windows)
-        this(
-            GLSurface surface,
-            GLDevice gdevice,
-            CreateSwapChainInfo createInfo,
-            RCIAllocator allocator
-        )
-        {
-            hInstance = surface.hInstance;
-
-            auto deviceHandle = GetDC(surface.wnd);
-
-            immutable colorBits =   createInfo.format.redSize + 
-                                    createInfo.format.greenSize +
-                                    createInfo.format.blueSize +
-                                    createInfo.format.alphaSize;
-
-            immutable pfdFlags = createInfo.presentMode == PresentMode.immediate ?
-                (PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL) :
-                (PFD_DOUBLEBUFFER | PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL);
-
-            PIXELFORMATDESCRIPTOR pfd;
-            pfd.nSize = PIXELFORMATDESCRIPTOR.sizeof;
-            pfd.nVersion = 1;
-            pfd.dwFlags = pfdFlags;
-            pfd.iPixelType = PFD_TYPE_RGBA;
-            pfd.cRedBits = cast(ubyte) createInfo.format.redSize;
-            pfd.cGreenBits = cast(ubyte) createInfo.format.greenSize;
-            pfd.cBlueBits = cast(ubyte) createInfo.format.blueSize;
-            pfd.cAlphaBits = cast(ubyte) createInfo.format.alphaSize;
-            pfd.cDepthBits = cast(ubyte) createInfo.format.depthSize;
-            pfd.cStencilBits = cast(ubyte) createInfo.format.stencilSize;
-            pfd.cColorBits = cast(ubyte) colorBits;
-            pfd.iLayerType = PFD_MAIN_PLANE;
-
-            auto chsPixel = ChoosePixelFormat(deviceHandle, &pfd);
-            if (chsPixel == 0)
-            {
-                import std.conv : to;
-                LPSTR messageBuffer = null;
-
-                size_t size = FormatMessageA(
-                    FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-                    null, 
-                    cast(uint) GetLastError(), 
-                    MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US), 
-                    cast(LPSTR) &messageBuffer, 
-                    0, 
-                    null
-                );
-                throw new UnsupportException(messageBuffer.to!string);
-            }
-
-            if (!SetPixelFormat(deviceHandle, chsPixel, &pfd))
-            {
-                throw new UnsupportException(UnsupportType.interfaceOutdated);
-            }
-
-            auto ctx = wglCreateContext(deviceHandle);
-            if (!wglMakeCurrent(deviceHandle, ctx))
-            {
-                throw new UnsupportException(UnsupportType.interfaceOutdated);
-            }
-
-            initWGL();
-
-            int[] iattrib =  
-            [
-                WGL_SUPPORT_OPENGL_ARB, true,
-                WGL_DRAW_TO_WINDOW_ARB, true,
-                WGL_DOUBLE_BUFFER_ARB, createInfo.presentMode == PresentMode.immediate ? false : true,
-                WGL_RED_BITS_ARB, createInfo.format.redSize,
-                WGL_GREEN_BITS_ARB, createInfo.format.greenSize,
-                WGL_BLUE_BITS_ARB, createInfo.format.blueSize,
-                WGL_ALPHA_BITS_ARB, createInfo.format.alphaSize,
-                WGL_DEPTH_BITS_ARB, createInfo.format.depthSize,
-                WGL_COLOR_BITS_ARB, colorBits,
-                WGL_STENCIL_BITS_ARB, createInfo.format.stencilSize,
-                WGL_PIXEL_TYPE_ARB, WGL_TYPE_RGBA_ARB,
-                0
-            ];
-
-            uint nNumFormats;
-            int[20] nPixelFormat;
-            wglChoosePixelFormatARB(
-                deviceHandle,   
-                iattrib.ptr, 
-                null,
-                20, nPixelFormat.ptr,
-                &nNumFormats
-            );
-
-            bool isSuccess = false;
-            foreach (i; 0 .. nNumFormats)
-            {
-                DescribePixelFormat(deviceHandle, nPixelFormat[i], pfd.sizeof, &pfd);
-                if (SetPixelFormat(deviceHandle, nPixelFormat[i], &pfd) == true)
-                {
-                    isSuccess = true;
-                    break;
-                }
-            }
-
-            if (!isSuccess)
-            {
-                throw new UnsupportException(UnsupportType.interfaceOutdated);
-            }
-
-            // Use deprecated functional
-            int[] attrib =  
-            [
-                WGL_CONTEXT_MAJOR_VERSION_ARB, 4,
-                WGL_CONTEXT_MINOR_VERSION_ARB, 5,
-                WGL_CONTEXT_FLAGS_ARB, WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB,
-                WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB,
-                0
-            ];
-
-            auto mctx = wglCreateContextAttribsARB(     deviceHandle, 
-                                                        null, 
-                                                        attrib.ptr);
-            if (mctx is null)
-            {
-                attrib =  
-                [
-                    WGL_CONTEXT_MAJOR_VERSION_ARB, 3,
-                    WGL_CONTEXT_MINOR_VERSION_ARB, 3,
-                    WGL_CONTEXT_FLAGS_ARB, WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB,
-                    WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB,
-                    0
-                ];
-
-                mctx = wglCreateContextAttribsARB(      deviceHandle, 
-                                                        null, 
-                                                        attrib.ptr);
-
-                if (mctx is null)
-                {
-                    throw new UnsupportException(UnsupportType.interfaceOutdated);
-                }
-            }
-
-            wglMakeCurrent(null, null);
-            wglDeleteContext(ctx);
-
-            if (!wglMakeCurrent(deviceHandle, mctx))
-            {
-                throw new UnsupportException(UnsupportType.interfaceOutdated);
-            }
-
-            if (loadOpenGL() < GLSupport.gl45)
-            {
-                throw new UnsupportException(UnsupportType.interfaceOutdated);
-            }
-
-            this.dc = deviceHandle;
-
-            glEnable(GL_DEBUG_OUTPUT);
-            glDebugMessageCallback(cast(GLDEBUGPROC) &__glLog, &gdevice.nlgInfo);
-        }
-
-        void swapBuffers(shared CmdPresentInfo info)
-        {
-            version(Posix)
-                swapBuffersPosixImpl();
-
-            version(Windows)
-                swapBuffersWinImpl();
-        }
-    }
-}
-
-final class GLSurface : Surface
-{
-    private
-    {
-        version(Posix)
-        {
-            Display* dpy;
-            Window* drawable;
-            GLXContext context;
-
-            void posixInit(CreateSurfaceInfo createInfo) @trusted
-            {
-                this.dpy = cast(Display*) createInfo.windowInfo.dpy;
-                this.drawable = createInfo.wnd;
-
-                int fbclen;
-                GLXFBConfig* fbcs = glXGetFBConfigs(dpy, 0, &fbclen);
-                scope(exit) XFree(fbcs);
-
-                formats = makeArray!(SurfaceFormat)(allocator, fbclen);
-
-                foreach (i; 0 .. fbclen)
-                {
-                    auto fbc = fbcs[i];
-
-                    Format fmt;
-                    glXGetFBConfigAttrib(dpy, fbc, GLX_RED_SIZE, cast(int*) &fmt.redSize);
-                    glXGetFBConfigAttrib(dpy, fbc, GLX_GREEN_SIZE, cast(int*) &fmt.greenSize);
-                    glXGetFBConfigAttrib(dpy, fbc, GLX_BLUE_SIZE, cast(int*) &fmt.blueSize);
-                    glXGetFBConfigAttrib(dpy, fbc, GLX_ALPHA_SIZE, cast(int*) &fmt.alphaSize);
-                    glXGetFBConfigAttrib(dpy, fbc, GLX_DEPTH_SIZE, cast(int*) &fmt.depthSize);
-                    glXGetFBConfigAttrib(dpy, fbc, GLX_STENCIL_SIZE, cast(int*) &fmt.stencilSize);
-
-                    PresentMode pmode;
-                    int bmode;
-                    glXGetFBConfigAttrib(dpy, fbc, GLX_DOUBLEBUFFER, &bmode);
-
-                    if (bmode)
-                        pmode = PresentMode.fifo;
-                    else
-                        pmode = PresentMode.immediate;
-
-                    formats[i] = SurfaceFormat(fmt, pmode);
-                }
-            }
-        }
-
-        version(Windows)
-        {
-            HMODULE hInstance;
-            HWND wnd;
-
-            void win32Init(CreateSurfaceInfo createInfo) @trusted
-            {
-                if (!IsWindow(*createInfo.windowInfo.wnd))
-                {
-                    throw new InvalidWindow(createInfo);
-                }
-
-                auto info = __gapi_init_wgl();
-
-                uint nums = 0;
-                wglGetPixelFormatAttribivARB(
-                    info.dc,
-                    0,
-                    0,
-                    1,
-                    [WGL_NUMBER_PIXEL_FORMATS_ARB].ptr,
-                    cast(int*) &nums
-                );
-
-                formats = makeArray!(SurfaceFormat)(allocator, nums);
-                foreach (i; 1 .. nums)
-                {
-                    Format format;
-                    wglGetPixelFormatAttribivARB(
-                        info.dc,
-                        i,
-                        0,
-                        6,
-                        [
-                            WGL_RED_BITS_ARB,
-                            WGL_GREEN_BITS_ARB,
-                            WGL_BLUE_BITS_ARB,
-                            WGL_ALPHA_BITS_ARB,
-                            WGL_DEPTH_BITS_ARB,
-                            WGL_STENCIL_BITS_ARB,
-                        ].ptr,
-                        cast(int*) &format
-                    );
-
-                    PresentMode mode;
-                    uint md;
-                    wglGetPixelFormatAttribivARB(
-                        info.dc,
-                        i,
-                        0,
-                        1,
-                        [
-                            WGL_DOUBLE_BUFFER_ARB
-                        ].ptr,
-                        cast(int*) &md
-                    );
-                    mode = md == 1 ? PresentMode.fifo : PresentMode.immediate;
-
-                    formats[i - 1] = SurfaceFormat(format, mode);
-                }
-
-                __gapi_dst_twnd(info);
-
-                this.hInstance = createInfo.windowInfo.hInstance;
-                this.wnd = *createInfo.windowInfo.wnd;
-            }
-        }
-    }
-
-    public
-    {
-        
-        RCIAllocator allocator;
-        SurfaceFormat[] formats;
-    }
-
-    public
-    {
-        this(CreateSurfaceInfo createInfo, RCIAllocator allocator)
-        {
-            this.allocator = allocator;
-            version(Posix)
-                posixInit(createInfo);
-
-            version(Windows)
-                win32Init(createInfo);
-        }
-
-        SurfaceFormat[] getFormats()
-        {
-            return this.formats;
-        }
-
-        SwapChain createSwapChain(Device device, CreateSwapChainInfo createInfo)
-        {
-            GLDevice gdevice = cast(GLDevice) device;
-
-            GLSwapChain sc;
-
-            version(Posix)
-                sc = make!(GLSwapChain)(allocator, dpy, this, gdevice, createInfo, allocator);
-
-            version(Windows)
-                sc = make!(GLSwapChain)(allocator, this, gdevice, createInfo, allocator);
-
-            return sc;
-        }
-
-        ~this()
-        {
-            dispose(allocator, formats);
-        }
-    }
-}
-
 enum __gapi_gl_dev_type
 {
     integrated_intel,
@@ -2834,6 +3285,7 @@ struct __gapi_gl_dinfo
 final class GLInstance : Instance
 {
     RCIAllocator allocator;
+    bool nvmlAvalible = false;
 
     private
     {
@@ -2842,27 +3294,40 @@ final class GLInstance : Instance
             void posixLoadImpl() @trusted
             {
                 dglx.glx.loadGLXLibrary();
-                loadNVML();
-                nvmlInit_v2();
+                if (!loadNVML())
+                {
+                    nvmlAvalible = false;
+                } else
+                {
+                    nvmlAvalible = true;
+                    nvmlInit_v2();
+                }
             }
 
             PhysDevice[] posixEnumImpl() @trusted
             {
                 import std.conv : to;
 
-                uint cc;
-                nvmlDeviceGetCount_v2(&cc);
-
-                PhysDevice[] pds;
-                foreach (i; 0 .. cc)
+                if (nvmlAvalible)
                 {
-                    nvmlDevice_t dev;
-                    nvmlDeviceGetHandleByIndex_v2(i, &dev);
+                    uint cc;
+                    nvmlDeviceGetCount_v2(&cc);
 
-                    pds ~= make!(GLPhysDevice)(allocator, dev, allocator);
+                    PhysDevice[] pds;
+                    foreach (i; 0 .. cc)
+                    {
+                        nvmlDevice_t dev;
+                        nvmlDeviceGetHandleByIndex_v2(i, &dev);
+
+                        pds ~= make!(GLPhysDevice)(allocator, dev, allocator);
+                    }
+
+                    return pds;
+                } else
+                {
+                    // AMD not support, but... Only intel.
+                    return [make!(GLPhysDevice)(allocator, null, allocator)];
                 }
-
-                return pds;
             }
         }
 
@@ -2895,8 +3360,6 @@ final class GLInstance : Instance
 
                     return [ph];
                 }
-
-                //return null;
             }
         }
     }
@@ -2931,13 +3394,97 @@ final class GLInstance : Instance
                 ValidationLayer(
                     "GAPIErrorHandle",
                     false
+                ),
+                ValidationLayer(
+                    "GAPIInputValidate",
+                    false
                 )
             ];
+
+            foreach (e; icInfo.extensions)
+            {
+                switch (e)
+                {
+                    version(Posix)
+                    {
+                        case "GAPIPosixX11WindowInfo":
+                        {
+                            import gapi.extensions.pxx11;
+                            import gapi.gl.extensions.pxx11;
+
+                            createSurfaceFromWindow = (Instance instance, PosixX11WindowInfo windowInfo)
+                            {
+                                GLInstance glinstance = cast(GLInstance) instance;
+                                GLPosixX11Surface surface = make!(GLPosixX11Surface)(glinstance.allocator, windowInfo, glinstance.allocator);
+
+                                return surface;
+                            };
+                        }
+                        break;
+                    }
+                    
+                    version(Windows)
+                    {
+                        case "GAPIWin32WindowInfo":
+                        {
+                            import gapi.extensions.win32wi;
+                            import gapi.gl.extensions.win32wi;
+
+                            createSurfaceFromWindow = (Instance instance, Win32WindowInfo windowInfo)
+                            {
+                                GLInstance glinstance = cast(GLInstance) instance;
+                                GLWin32Surface surface = make!(GLWin32Surface)(glinstance.allocator, windowInfo, glinstance.allocator);
+
+                                return surface;
+                            };
+                        }
+                        break;
+                    }
+
+                    case "GAPISDLWindowInfo":
+                    {
+                        import gapi.extensions.sdlsurface;
+                        import gapi.gl.extensions.sdlsurface;
+
+                        createSurfaceFromWindow = &SDL_CreateGAPISurface;
+                    }
+                    break;
+
+                    case "GAPIVideoDecode":
+                    {
+                        import gapi.extensions.videodecode;
+                        import gapi.gl.extensions.videodecode;
+
+                        videoDecodeInit();
+                    }
+                    break;
+
+                    default:
+                    {
+                        // warning
+                    }
+                    break;
+                }
+            }
         }
 
         string[] getExtensions() @trusted
         {
-            return [];
+            string[] extensions;
+            version(Windows)
+            {
+                extensions ~= ["GAPIWin32WindowInfo"];
+            }
+
+            version(Posix)
+            {
+                extensions ~= ["GAPIPosixX11WindowInfo"];
+            }
+
+            extensions ~= ["GAPISDLWindowInfo"];
+            extensions ~= ["GAPIVideoDecode"];
+
+            return extensions;
         }
 
         PhysDevice[] enumeratePhysicalDevices()
@@ -2954,13 +3501,6 @@ final class GLInstance : Instance
             GLPhysDevice glpdevice = cast(GLPhysDevice) pdevice;
 
             return make!(GLDevice)(allocator, glpdevice, createInfo.queueCreateInfos, createInfo.validationLayers, allocator);
-        }
-
-        Surface createSurface(CreateSurfaceInfo createInfo)
-        {
-            GLSurface gsurface = make!(GLSurface)(allocator, createInfo, allocator);
-
-            return gsurface;
         }
 
         ValidationLayer[] enumerateValidationLayers()

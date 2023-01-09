@@ -1,0 +1,2 @@
+name "03--vertex-layout"
+dependency "gapi" path="../../"

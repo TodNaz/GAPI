@@ -1,6 +1,6 @@
 module gapi.extensions.backendnative;
 
-import std.experimental.logger;
+import gapi.extensions.utilmessenger : Logger;
 
 struct NativeLoggingInfo
 {

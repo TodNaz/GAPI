@@ -59,12 +59,15 @@ bool loadNVML() @trusted
 {
     import std.file : exists;
     import std.string : toStringz;
+    import std.stdio : writeln;
 
     string[] paths;
 
     version(Posix)
         paths = [
             "/opt/nvidia/lib/libnvidia-ml.so",
+            "/usr/lib/libnvidia-ml.so",
+            "/usr/lib/libnvidia-ml.so.1"
         ];
     
     version(Windows)
@@ -78,7 +81,11 @@ bool loadNVML() @trusted
     {
         bindSymbol(nvcfg, ptr, name.toStringz);
 
-        if(*ptr is null) throw new Exception("Not load NV library with: " ~ name);
+        if(*ptr is null) 
+        {
+            writeln ("[WARNING] Bad symbol with: ", name);
+            throw new Exception("Not load NV library with: " ~ name);
+        }
     }
 
     foreach (path; paths)
@@ -88,20 +95,29 @@ bool loadNVML() @trusted
 
         nvcfg = load(path.toStringz);
         if (nvcfg == invalidHandle)
+        {
+            writeln("[WARNING] nvml bad library: ", path);
             continue;
+        }
 
-        bindOrError(cast(void**) &nvmlInit_v2, "nvmlInit_v2");
-        bindOrError(cast(void**) &nvmlUnitGetCount, "nvmlUnitGetCount");
-        bindOrError(cast(void**) &nvmlUnitGetHandleByIndex, "nvmlUnitGetHandleByIndex");
+        try
+        {
+            bindOrError(cast(void**) &nvmlInit_v2, "nvmlInit_v2");
+            bindOrError(cast(void**) &nvmlUnitGetCount, "nvmlUnitGetCount");
+            bindOrError(cast(void**) &nvmlUnitGetHandleByIndex, "nvmlUnitGetHandleByIndex");
 
-        bindOrError(cast(void**) &nvmlDeviceGetCount_v2, "nvmlDeviceGetCount_v2");
-        bindOrError(cast(void**) &nvmlDeviceGetHandleByIndex_v2, "nvmlDeviceGetHandleByIndex_v2");
-        bindOrError(cast(void**) &nvmlDeviceGetName, "nvmlDeviceGetName");
-        bindOrError(cast(void**) &nvmlDeviceGetMinorNumber, "nvmlDeviceGetMinorNumber");
-        bindOrError(cast(void**) &nvmlDeviceGetUUID, "nvmlDeviceGetUUID");
-        bindOrError(cast(void**) &nvmlDeviceGetCreatableVgpus, "nvmlDeviceGetCreatableVgpus");
-        bindOrError(cast(void**) &nvmlVgpuTypeGetFramebufferSize, "nvmlVgpuTypeGetFramebufferSize");
-        bindOrError(cast(void**) &nvmlSystemGetDriverVersion, "nvmlSystemGetDriverVersion");
+            bindOrError(cast(void**) &nvmlDeviceGetCount_v2, "nvmlDeviceGetCount_v2");
+            bindOrError(cast(void**) &nvmlDeviceGetHandleByIndex_v2, "nvmlDeviceGetHandleByIndex_v2");
+            bindOrError(cast(void**) &nvmlDeviceGetName, "nvmlDeviceGetName");
+            bindOrError(cast(void**) &nvmlDeviceGetMinorNumber, "nvmlDeviceGetMinorNumber");
+            bindOrError(cast(void**) &nvmlDeviceGetUUID, "nvmlDeviceGetUUID");
+            bindOrError(cast(void**) &nvmlDeviceGetCreatableVgpus, "nvmlDeviceGetCreatableVgpus");
+            bindOrError(cast(void**) &nvmlVgpuTypeGetFramebufferSize, "nvmlVgpuTypeGetFramebufferSize");
+            bindOrError(cast(void**) &nvmlSystemGetDriverVersion, "nvmlSystemGetDriverVersion");
+        } catch (Exception exception)
+        {
+            continue;
+        }
 
         try
         {

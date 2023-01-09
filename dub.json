@@ -1,0 +1,145 @@
+{
+	"authors": [
+		"Тосюков Назар <mrnazar44@gmail.com>"
+	],
+	"configurations": [
+		{
+			"dependencies": {
+				"bindbc-opengl": "~>1.0.2"
+			},
+			"name": "glbackend-wgl-executable",
+			"platforms": [
+				"windows"
+			],
+			"targetType": "executable",
+			"versions": [
+				"GL_46",
+				"GL_ARB",
+				"BackendGL"
+			]
+		},
+		{
+			"dependencies": {
+				"bindbc-opengl": "~>1.0.2"
+			},
+			"name": "glbackend-wgl",
+			"platforms": [
+				"windows"
+			],
+			"targetType": "library",
+			"versions": [
+				"GL_46",
+				"GL_ARB",
+				"BackendGL"
+			]
+		},
+		{
+			"dependencies": {
+				"bindbc-opengl": "~>1.0.2",
+				"x11": "~>1.0.21"
+			},
+			"name": "glbackend-glx",
+			"platforms": [
+				"posix"
+			],
+			"targetType": "library",
+			"versions": [
+				"Dynamic_GLX",
+				"GL_46",
+				"GL_ARB",
+				"BackendGL"
+			]
+		},
+		{
+			"dependencies": {
+				"bindbc-opengl": "~>1.0.2",
+				"x11": "~>1.0.21"
+			},
+			"name": "glbackend-glx-exe",
+			"platforms": [
+				"posix"
+			],
+			"targetType": "executable",
+			"versions": [
+				"Dynamic_GLX",
+				"GL_46",
+				"GL_ARB",
+				"BackendGL"
+			]
+		},
+		{
+			"dependencies": {
+				"directx-d": "~>0.14.0"
+			},
+			"name": "dxbackend",
+			"platforms": [
+				"windows"
+			],
+			"targetType": "library",
+			"versions": [
+				"BackendDX"
+			]
+		},
+		{
+			"dependencies": {
+				"erupted": "*",
+				"x11": "~>1.0.21"
+			},
+			"name": "vkbackend",
+			"platforms": [
+				"windows",
+				"posix"
+			],
+			"targetType": "library",
+			"versions": [
+				"BackendVK"
+			]
+		},
+		{
+			"dependencies": {
+				"erupted": "*",
+				"x11": "~>1.0.21"
+			},
+			"name": "vkbackend-executable",
+			"platforms": [
+				"windows",
+				"posix"
+			],
+			"targetType": "executable",
+			"versions": [
+				"BackendVK"
+			]
+		},
+		{
+			"dependencies": {
+				"x11": "~>1.0.21"
+			},
+			"name": "sfbackend-executable",
+			"platforms": [
+				"windows",
+				"posix"
+			],
+			"targetType": "executable",
+			"versions": [
+				"BackendSF"
+			]
+		}
+	],
+	"copyright": "Copyright © 2022, Тосюков Назар",
+	"dependencies": {
+		"bindbc-loader": "~>1.0.1",
+		"bindbc-sdl": "~>1.2.2"
+	},
+	"description": "Обвязка графического интерфейса над бекендами других интерфейсов для доступа к многопоточности и разрешения конфликта систем, используется в личных целях и опубликован в идеях того, что кому либо он может пригодиться",
+	"license": "MIT",
+	"name": "gapi",
+	"subPackages": [
+		"./tests/01-DeviceCreation",
+		"./tests/02-SwapChainCreation",
+		"./tests/03-VertexLayout",
+		"./tests/04-Texture2D"
+	],
+	"versions": [
+		"SDL_2022"
+	]
+}

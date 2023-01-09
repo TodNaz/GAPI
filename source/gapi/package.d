@@ -71,6 +71,18 @@ struct PhysDeviceLimits
 
         /// TODO: как нить потом прокоментирую
         uint sampleCounts;
+
+        uint maxComputeSharedMemorySize;
+
+        uint[3] maxComputeWorkGroupCount;
+
+        uint maxComputeWorkGroupInvocations;
+
+        uint[3] maxComputeWorkGroupSize;
+
+        uint subPixelPrecisionBits;
+
+        uint maxViewports;
     }
 }
 
@@ -86,6 +98,9 @@ struct PhysDeviceFeatures
 {
     public
     {
+        /// Поддержка теста scissor.
+        bool scissor;
+
         /// Поддержка геометрический шейдеров.
         bool geometryShader;
         
@@ -149,7 +164,10 @@ enum PhysDeviceType
     discrete,
 
     /// Виртуальное устройство, выполняющее вычисления с помощью процессора.
-    cpu
+    cpu,
+
+    /// Устройство реализовано на собственном бекенде.
+    nativeCPU
 }
 
 /++
@@ -159,6 +177,8 @@ struct PhysDeviceProperties
 {
     public
     {
+        bool avalibleForCreation;
+
         /// Версия драйвера, исполняющая бекенд.
         ///
         /// Обратите внимание, указывается драйвер вендора видеокарты, а не
@@ -242,6 +262,8 @@ interface PhysDevice
         /// физическом устройстве.
         PhysDeviceProperties getProperties();
 
+        string[] extensions();
+
         /// Функция выдаёт доступные под создание очереди.
         QueueFamilyProperties[] getQueueFamilyProperties();
     }
@@ -281,6 +303,11 @@ struct QueueCreateInfo
 +/
 struct ValidationLayerInfo
 {
+    import  gapi.extensions.backendnative;
+    import  gapi.extensions.errhandle;
+    import  gapi.extensions.inputvalidate;
+    import  gapi.extensions.utilmessenger;
+
     public
     {
         /// Имя структуры, которую нужно инциализировать.
@@ -290,21 +317,27 @@ struct ValidationLayerInfo
         bool enabled = false;
         
         /// Передаваемые данные для инициализации структуры.
-        void[] initData;
-    }
-
-    this(string name, bool enabled, void[] initData)
-    {
-        this.name = name;
-        this.enabled = enabled;
-        this.initData = initData;
+        union
+        {
+            NativeLoggingInfo nativeLoggingInfo;
+            ErrorLayerInfo errorLayerInfo;
+            InputValidationLayer inputValidationLayer;
+            LoggingDeviceInfo loggingDeviceInfo;
+        }
     }
 
     this(T)(string name, bool enabled, T initData)
     {
         this.name = name;
         this.enabled = enabled;
-        this.initData = cast(void[]) (cast(void*) &initData)[0 .. T.sizeof];
+        
+        static foreach (member; __traits(allMembers, typeof(this)))
+        {
+            static if (is(typeof(__traits(getMember, typeof(this), member)) == T))
+            {
+                __traits(getMember, typeof(this), member) = initData;
+            }
+        }
     }
 }
 
@@ -390,6 +423,8 @@ enum CommandType
     /// See_Also: CmdCreatePipeline
     createPipeline,
 
+    createComputePipeline,
+
     /// Номер команды отображения буфера в адресное пространство пользователя.
     ///
     /// See_Also: CmdMapBuffer
@@ -471,7 +506,16 @@ enum CommandType
     /// Номер команды уничтожения кадрового буфера.
     ///
     /// See_Also: CmdDestroyFrameBuffer
-    destroyFrameBuffer
+    destroyFrameBuffer,
+
+    createImageView,
+
+    updateImageView,
+
+    /// Команда, которая не входит в состав обычных команд
+    ///
+    /// See_Also: Device.extesions, CmdExt
+    extensionCommand
 }
 
 /++
@@ -677,7 +721,9 @@ enum StageType
     fragment,
 
     /// Геометрический шейдер.
-    geometry
+    geometry,
+
+    compute
 }
 
 /++
@@ -976,6 +1022,11 @@ struct UniformDescript
     }
 }
 
+interface ImageView
+{
+
+}
+
 /++
 Описание привязки картинки к конвееру.
 +/
@@ -1233,6 +1284,23 @@ struct CmdDraw
         PrimitiveTopology topology = PrimitiveTopology.triangles;
     }
 }
+
+// struct CmdMultiDraw
+// {
+//     public
+//     {
+//         Pipeline pipeline;
+
+//         Buffer[] vertexBuffers;
+
+//         Buffer[] elementBuffers;
+
+//         uint[] count;
+
+//         /// Тип рисуемых объектов.
+//         PrimitiveTopology topology = PrimitiveTopology.triangles;
+//     }
+// }
 
 /++ 
 Команда копирования данных между двумя буферами.
@@ -1530,6 +1598,61 @@ struct CmdDestroyFrameBuffer
     }
 }
 
+struct ImageViewInfo
+{
+    public
+    {
+        Image image;
+        ImageType viewType;
+        InternalFormat format;
+
+        size_t baseLevel;
+        size_t numLevels;
+
+        size_t baseLayer;
+        size_t numLayers;
+    }
+}
+
+struct CmdCreateImageView
+{
+    public
+    {
+        ImageView* imageView;
+
+        ImageViewInfo viewInfo;
+    }
+}
+
+struct CmdUpdateImageView
+{
+    public
+    {
+        ImageView imageView;
+
+        ImageViewInfo viewInfo;
+    }
+}
+
+struct CmdExt
+{
+    public
+    {
+        string extension;
+        ulong id;
+        void[] data;
+    }
+}
+
+struct CmdCreateComputePipeline
+{
+    public
+    {
+        Pipeline* pipeline;
+        ShaderStage stage;
+    }
+}
+
 /++
 Структура описания команды.
 +/
@@ -1571,6 +1694,10 @@ struct Command
             CmdDestroyPipeline destroyPipelineInfo;
             CmdDestroyFrameBuffer destroyFrameBufferInfo;
             CmdEditSampler editSamplerInfo;
+            CmdCreateImageView createImageViewInfo;
+            CmdUpdateImageView updateImageViewInfo;
+            CmdExt extensionInfo;
+            CmdCreateComputePipeline createCompute;
         }
 
         debug
@@ -1746,7 +1873,7 @@ interface Buffer
 {
     public
     {
-
+        immutable(size_t) length() @safe;
     }
 }
 
@@ -1831,50 +1958,6 @@ interface Device
         Функция обработки всех очередей.
         +/
         void handleQueues();
-    }
-}
-
-version(Windows)
-struct Win32WindowInfo
-{
-    import core.sys.windows.windows;
-
-    public
-    {
-        HMODULE hInstance;
-        HANDLE* wnd;
-    }
-}
-
-version(Posix)
-struct PosixX11WindowInfo
-{
-    import x11.Xlib;
-    import x11.X;
-
-    public
-    {
-        Display* dpy;
-        Window* wnd;
-    }
-}
-
-/++
-Информация о создании поверхности окна.
-+/
-struct CreateSurfaceInfo
-{
-    public
-    {
-        version(Windows)
-        {
-            Win32WindowInfo windowInfo;
-        }
-
-        version(Posix)
-        {
-            PosixX11WindowInfo windowInfo;
-        }
     }
 }
 
@@ -1980,7 +2063,6 @@ interface SwapChain
 {
     public
     {
-
     }
 }
 
@@ -2043,12 +2125,6 @@ interface Instance
         ///     createInfo = Информация о создании дескриптора устройства.
         Device createDevice(PhysDevice pdevice, DeviceCreateInfo createInfo);
 
-        /// Создать поверхность для окна.
-        ///
-        /// Params:
-        ///     createInfo = Информация о создании поверхности для окна.
-        Surface createSurface(CreateSurfaceInfo createInfo);
-
         /// Получить доступные слои валидации ошибок и данных.
         ValidationLayer[] enumerateValidationLayers();
     }
@@ -2071,9 +2147,12 @@ struct CreateInstanceInfo
     }
 }
 
-alias CreateInstanceFunc = void function(immutable CreateInstanceInfo, RCIAllocator, ref Instance) @safe;
+alias CreateInstanceFunc = void function(immutable CreateInstanceInfo, RCIAllocator, ref Instance);
+alias ExtensionsEnumFunc = string[] function(RCIAllocator allocator);
 
 /++
 Создаёт экземпляр работы с библиотекой.
 +/
 CreateInstanceFunc createInstance;
+
+ExtensionsEnumFunc enumerateExtensions;

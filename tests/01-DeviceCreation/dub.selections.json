@@ -1,0 +1,12 @@
+{
+	"fileVersion": 1,
+	"versions": {
+		"bindbc-loader": "1.0.1",
+		"bindbc-opencl": "0.1.0",
+		"bindbc-opengl": "1.0.3",
+		"bindbc-sdl": "1.2.2",
+		"directx-d": "0.14.0",
+		"erupted": "2.1.78+v1.3.228",
+		"x11": "1.0.21"
+	}
+}

@@ -32,6 +32,7 @@ static immutable GLX_MAX_PBUFFER_HEIGHT = 0x8017;
 
 static immutable GLX_WINDOW_BIT = 0x00000001;
 static immutable GLX_PIXMAP_BIT = 0x00000002;
+static immutable GLX_PBUFFER_BIT = 0x0004;
 static immutable GLX_RGBA_BIT = 0x00000001;
 static immutable GLX_TRUE_COLOR = 0x8002;
 static immutable GLX_RGBA_TYPE = 0x8014;
@@ -82,6 +83,8 @@ alias FglXGetFBConfigs = extern(C) GLXFBConfig* function(Display *dpy, int scree
 alias FglXCreateWindow = extern(C) GLXWindow function(Display* dpy, GLXFBConfig config, Window win, const int* al);
 alias FglXDestroyWindow = extern(C) void function(Display* dpy, GLXWindow wnd);
 alias FglXCreatePixmap = extern(C) GLXPixmap function(Display* dpy, GLXFBConfig config, Pixmap pixmap, const int* attribs);
+alias FglXCreateGLXPixmap = extern(C) GLXPixmap function(Display* dpy, XVisualInfo* vis, Pixmap pixmap);
+alias FglXMakeContextCurrent = extern(C) bool function(Display* dpy, XID draw, XID read, GLXContext ctx);
 
 __gshared
 {
@@ -105,6 +108,8 @@ __gshared
     FglXCreateWindow glXCreateWindow;
     FglXDestroyWindow glXDestroyWindow;
     FglXCreatePixmap glXCreatePixmap;
+    FglXCreateGLXPixmap glXCreateGLXPixmap;
+    FglXMakeContextCurrent glXMakeContextCurrent;
 }
 
 static string[] glxDefaultPaths = [
@@ -249,6 +254,8 @@ void loadGLXLibrary() @trusted
                 bindOrError(cast(void**) &glXCreateWindow, "glXCreateWindow");
                 bindOrError(cast(void**) &glXDestroyWindow, "glXDestroyWindow");
                 bindOrError(cast(void**) &glXCreatePixmap, "glXCreatePixmap");
+                bindOrError(cast(void**) &glXCreateGLXPixmap, "glXCreateGLXPixmap");
+                bindOrError(cast(void**) &glXMakeContextCurrent, "glXMakeContextCurrent");
 
                 isSucces = true;
                 cachelib = path;
